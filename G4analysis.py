@@ -8,9 +8,7 @@ class manager(object):
     model of TOFED.
     """
 
-    def __init__(
-                self, filename, protonrespfile, S1ID_list,
-                S2ID_list, flight_angle_range, th_tof=20, th_DAQ=0):
+    def __init__(self, file_lop_s1, file_lop_s2, radius=0.75):
 
         """
         args:
@@ -25,33 +23,17 @@ class manager(object):
             S2ID_list: the detector ID of S2 detector
         """
         # geometry
-        self.TOFradius = 0.75  # meters
-        self.flight_angle_range = flight_angle_range  # degrees
-        # load data from pronton response file
-        ProtonRespdata = np.loadtxt(protonrespfile)
-        self.Eplist = ProtonRespdata[:, 0]
-        self.Eeelist = ProtonRespdata[:, 1]
-        self.protonrespfun = interpolate.interp1d(self.Eplist, self.Eeelist)
-        # load data from G4 file
-        data = np.loadtxt(filename)
-        index_DAQ = (data[:, 1] > th_DAQ) & (data[:, 2] > th_DAQ)
-        index_tof = data[:, 0] > th_tof
-        index_S1 = np.in1d(data[:, 3], S1ID_list)
-        index_S2 = np.in1d(data[:, 4], S2ID_list)
-        index = index_DAQ & index_tof & index_S1 & index_S2
-        self.filename = filename
-        self.data = data[index, :]
-        self.tof = self.data[:, 0]
-        self.Eees1 = self.data[:, 1]
-        self.Eees2 = self.data[:, 2]
-        self.S1_ID = self.data[:, 3]
-        self.S2_ID = self.data[:, 4]
-        self.eventID = self.data[:, 5]
-        self.Enlist = self.Get_En(self.tof)
-        self.th_DAQ = th_DAQ
-        print("%s has loaded successfully!" % (self.filename))
+        self.radius = 0.75  # meters
 
-    def Get_En(self, tof):
+        # load light output data
+        data_lop_s1 = np.loadtxt(file_lop_s1)
+        self.lop_s1 = interpolate.interp1d(
+            data_lop_s1[:, 0], data_lop_s1[:, 1])
+        data_lop_s2 = np.loadtxt(file_lop_s2)
+        self.lop_s2 = interpolate.interp1d(
+            data_lop_s2[:, 0], data_lop_s2[:, 1])
+
+    def get_En(self, tof):
 
         """
         args:
@@ -61,62 +43,76 @@ class manager(object):
             the energy of the neutron(unit keV)
         """
         constant = 5228.157
-        En = constant * ((2 * self.TOFradius) ** 2) / tof ** 2
+        En = constant * ((2 * self.radius) ** 2) / tof ** 2
         return En * 1000
 
-    def PHofS1(self, En, flight_angle):
+    def ph_s1(self, tof, angle):
         """
         args:
             En: neutron energy keV
-            flight_angle: flght angle
+            angle: scattering angle
         return:
-            the pulse height(Eee) of the proton generated in S1 detector.
-            (the scatter neutron will arrive the S2 detector)
+            the pulse height (in unit keVee) of the proton generated in S1.
         """
-        Ep = En * (np.sin(flight_angle / 180.0 * np.pi) ** 2)
-        return self.protonrespfun(Ep)
+        Ep = self.get_En(tof) * np.sin(np.radians(angle)) ** 2
+        return self.lop_s1(Ep)
 
-    def PHofS2(self, En, flight_angle):
+    def ph_s2(self, tof, angle):
         """
         args:
             En: neutron energy keV
-            flight_angle: flght angle
+            angle: scattering angle
         return:
-            the max pulse height(Eee) of the proton generated in S2 detector.
-            (the scatter neutron will arrive the S2 detector)
+            the maximum pulse height (in unit keVee)
+            of the proton generated in S2.
         """
-        Ep = En * (np.cos(flight_angle / 180.0 * np.pi) ** 2)
-        print(Ep)
-        return self.protonrespfun(Ep)
+        Ep = self.get_En(tof) * np.cos(np.radians(angle)) ** 2
+        return self.lop_s2(Ep)
 
-    def fixed_selection_s1(self, En, ratio_wider=0.0):
+    def fix_sel(self, ph, range_ph):
         """
         args:
             En: neutron energy
-            ratio_expand: make the threshold wider
+            k: make the threshold wider
         return:
             bool array
-            it is True if the event meet the condition.
-            it is False if the event does ont meet the condition.
+            True: if the event meet the condition.
+            False: if the event does ont meet the condition.
         """
         # selection on S1, Eees1 should be in the fixed window
-        th_min = self.PHofS1(En, self.flight_angle_range[0]) * (1 - ratio_wider)
-        th_max = self.PHofS1(En, self.flight_angle_range[1]) * (1 + ratio_wider)
-        return (self.Eees1 > th_min) & (self.Eees1 < th_max)
+        ph_low = range_ph[0]
+        ph_high = range_ph[1]
+        idx1 = (ph > ph_low)
+        idx2 = (ph < ph_high)
+        return idx1 & idx2
 
-    def kinetic_selection_s1(self, ratio_wider=0.0):
+    def kin_sel_s1(self, ph, tof, range_angle, k=[1.0, 1.0]):
         """
         single kinematics energy selection
         args:
-            flight_angle_range: neutron flight angle range of the s2 detector
+            ph: ph list of s1
+            tof: time of flight
+            range_angle: flight angle range of scaterring neutrons
             for TOFED it is (18, 42) degrees with no regards of the two rings.
         return:
             bool array
         """
-        th_min = self.PHofS1(self.Enlist, self.flight_angle_range[0]) * (1 - ratio_wider)
-        th_max = self.PHofS1(self.Enlist, self.flight_angle_range[1]) * (1 + ratio_wider)
-        return (self.Eees1 > th_min) & (self.Eees1 < th_max)
+        ph_low = self.ph_s1(tof, range_angle[0]) * k[0]
+        ph_high = self.ph_s1(tof, range_angle[1]) * k[1]
+        idx1 = ph > ph_low
+        idx2 = ph < ph_high
+        return idx1 & idx2
 
-    def kinetic_selection_s2(self, ratio_wider=0.0):
-        th_max = self.PHofS2(self.Enlist, self.flight_angle_range[0]) * (1 + ratio_wider)
-        return (self.Eees2 > self.th_DAQ) & (self.Eees2 < th_max)
+    def kin_sel_s2(self, ph, tof, angle_min, k=1.0):
+        """
+        single kinematics energy selection
+        args:
+            ph: ph list of s1
+            tof: time of flight
+            angle_min: the minimum of flight angle
+            for TOFED it is (18, 42) degrees with no regards of the two rings.
+        return:
+            bool array
+        """
+        ph_high = self.ph_s1(tof, angle_min) * k
+        return ph < ph_high

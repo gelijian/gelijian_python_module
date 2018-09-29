@@ -11,9 +11,12 @@
 # ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
 # FITNESS FOR A PARTICULAR PURPOSE.  See the license for more details.
 
-from ControlRoom import *
+import os
 import math
 import logging
+import numpy as np
+from ControlRoom import *
+
 
 _torus = Torus(R=1.88*meters, k=1.8)
 
@@ -279,3 +282,112 @@ def thermal_profile(Ti_core, Te_core, n_core, coordinates):
 
 def monobeam_profile(Eb, mu, n_core, coordinates):
     return _MonoBeamProfile(Eb, mu, n_core, coordinates)
+
+
+def gen_dir(time, shot, device):
+    dir_shot = os.path.join(time, "%d" % shot)
+    dir_sim = os.path.join(dir_shot, "simulation")
+    dir_nubeam = os.path.join(dir_sim, "nubeam")
+    dir_device = os.path.join(dir_sim, device)
+    dir_NES = os.path.join(dir_device, "NES")
+    if (not os.path.exists(dir_device)):
+        os.mkdir(dir_device)
+    if (not os.path.exists(dir_NES)):
+        os.mkdir(dir_NES)
+    return dir_shot, dir_sim, dir_nubeam, dir_device, dir_NES
+
+
+reaction = DDN3HeReaction()
+whichProduct = 1
+Emin, Emax, bins = 500*keV, 3520*keV, 151
+Enlist = np.arange(500, 3510, 20)
+Randomizer.seed(42)
+samples = 100000
+
+
+def cal_NES(coords_file, fbm_file, los_file, ni, Ti, samples=10**6):
+    ni, Ti, Te = ni / meters**3, Ti * keV, Ti * keV
+    coords = coordinates(coords_file)
+    d_profile = thermal_profile(Ti, Te, ni, coords)
+    b_profile = fbm_profile(fbm_file, coords)
+
+    # calculate each component
+    pairs = {}
+    pairs["thermal"] = (d_profile, d_profile)
+    pairs["beam-thermal"] = (d_profile, b_profile)
+    pairs["beam-beam"] = (b_profile, b_profile)
+    ratio_list = [0.5, 0.5, 0.125]
+    direct = np.zeros((len(Enlist), 2))
+    direct[:, 0] = Enlist
+    spectrums = {}
+    for i, (name, pair) in enumerate(pairs.items()):
+        log.info('Calculating {} spectrum...'.format(name))
+        cells = lineOfSight(losfile, pair[0], pair[1])
+        spectrum = CalculateVolumeSpectrum(
+            reaction, whichProduct, cells,
+            Emin, Emax, bins, samples,
+            E1range=(0.0*MeV, 1.0*MeV),
+            E2range=(0.0*MeV, 1.2*MeV),
+            Bdirection=Clockwise)
+        spectrum = spectrum * ratio_list[i]
+        data = []
+        for En in Enlist:
+            data.append([En, spectrum[En * keV].value])
+        data = np.array(data)
+        spectrums[name] = data
+        direct[:, 1] += data[:, 1]
+        log.info('done')
+    spectrums["direct"] = direct
+    return spectrums
+
+
+def cal_NES_WF(ni, Ti, coords_file, los_file, mulist, Eblist, samples=10**6):
+
+    # set the parameters of thermal plasma and beam ions
+    ni, Ti, Te = ni / meters**3, Ti * keV, Ti * keV
+    nb = 1.0e+19/meters**3
+    coords = coordinates(coords_file)
+    d_profile = thermal_profile(Ti, Ti, ni, coords)
+
+    # claculate the neutron energy spectrum for each(Eb, mu) element
+    for i, mu in enumerate(mulist):
+        for j, Eb in enumerate(Eblist):
+            start = time.time()
+            log.info("mu: %g, beam energy: %g keV" % (mu, Eb / keV))
+            log.info('Calculating beam-thermal spectrum...')
+            b_profile = monobeam_profile(Eb*keV, mu, nb, coords)
+            cells = lineOfSight(losfile, d_profile, b_profile)
+            beamthermal = CalculateVolumeSpectrum(
+                reaction, whichProduct, cells,
+                Emin, Emax, bins, samples,
+                E1range=(0.0*MeV, 1.0*MeV),
+                E2range=(0.0*MeV, 1.2*MeV),
+                Bdirection=Clockwise)
+            log.info('done')
+            beamthermal = beamthermal / 2.0
+            filename = "mu_%d_Eb_%d" % (i, j)
+            data = []
+            for En in Enlist:
+                data.append([En, beamthermal[En*keV].value])
+            data = np.array(data)
+            np.savetxt(os.path.join(dir_NES_WF, filename), data, fmt="%g")
+            stop = time.time()
+            print(stop - start)
+
+    np.savetxt("Enlist", Enlist, fmt="%g")
+    np.savetxt("Eblist", Eblist, fmt="%g")
+    np.savetxt("mulist", mulist, fmt="%g")
+    log.info("number of Eb: %g, number of mu: %g" % (len(Eblist), len(mulist)))
+
+
+# export spectrums to txt files
+for name, spectrum in spectrums.items():
+    np.savetxt(os.path.join(dir_NES, name), spectrum, fmt="%g")
+    intensity = spectrum[:, 1].sum()
+    portion = 100 * intensity / direct[:, 1].sum()
+    f_out.write(
+        "{}: intensity={} #/s, portion={}\n".format(name, intensity, portion))
+f_out.close()
+
+
+
