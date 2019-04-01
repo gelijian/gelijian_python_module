@@ -1,6 +1,45 @@
 #!/usr/bin/env python2.7
 import os
 import numpy as np
+from enum import Enum
+
+
+class Digitizer(Enum):
+    V1751 = 0
+    APV8508 = 1
+
+
+class Component(Enum):
+    total = 0
+    scatter = 1
+    bb = 2         
+    bt = 3
+    thermal = 4
+
+
+class RingType(Enum):
+    up = 0
+    bottom = 1
+
+
+DGZ_cfg = {Digitizer.V1751: {"name": "751"},
+           Digitizer.APV8508: {"name": "APV"}
+           }
+
+CPT_cfg = {Component.total: {"filename": "total", "label": "Total", "style": "r-"},
+           Component.scatter: {"filename": "scatter", "label": "Scatter", "style": "y--"},
+           Component.bb: {"filename": "beam-beam", "label": "Beam-beam", "style": "b--"},
+           Component.bt: {"filename": "beam-thermal", "label": "Beam-thermal", "style": "g--"}
+           }
+
+RT_cfg = {RingType.up: {"name": "up"},
+          RingType.bottom: {"name": "bottom"}
+          }
+
+
+def gaussian(x, miu, sigma):
+    y = (x - miu) / sigma
+    return np.exp(-0.5 * np.power(y, 2))
 
 
 def inrange(x, range_x):
@@ -12,11 +51,57 @@ def inrange(x, range_x):
     return idx1 & idx2
 
 
+def generate_bins(min, max, num):
+    binedge = np.arange(min, max, num)
+    binmiddle = 0.5 * (binedge[1:] + binedge[:-1])
+    return (binedge, binmiddle)
+
+
 def cash(x_exp, x_sim):
     """ Function doc """
     t1 = x_sim - x_exp
     t2 = x_exp * np.log(x_exp / x_sim)
     return 2 * (t1 + t2).sum()
+
+
+def generate_dirs(dir_shot, device):
+    dir_parameter = os.path.join(dir_shot, "shot_parameters")
+    dir_device = os.path.join(dir_shot, "simulation", device)
+    dir_NES = os.path.join(dir_device, "NES")
+    return (dir_parameter, dir_NES)
+
+
+def load_NES_sim(dir_NES, matrix_RF):
+    NES_sim_dict = {}
+    y_sim_dict = {}
+    for key, value in CPT_cfg.items():
+        file_NES = os.path.join(dir_NES, value["filename"])
+        NES = np.loadtxt(file_NES)
+        NES_sim_dict[key] = NES[:, 1]
+        y_sim_dict[key] = np.dot(matrix_RF, NES[:, 1])
+
+    NES_norm = NES_sim_dict[Component.total].max()
+    y_sim_norm = y_sim_dict[Component.total].max()
+
+    for key,_ in CPT_cfg.items():
+        NES_sim_dict[key] /= NES_norm
+        y_sim_dict[key] /= y_sim_norm
+
+    return (NES_sim_dict, y_sim_dict)
+
+
+def min_cash(x_exp, x_sim):
+    r0 = x_exp.sum() / x_sim.sum()
+    range_r = np.linspace(0.8 * r0, 1.2 * r0, 1000)
+    freedom = len(x_exp) - 2
+    c_min = 10000000
+    r_min = 0
+    for r in range_r:
+        c = cash(x_exp, x_sim * r)
+        if c < c_min:
+            c_min = c
+            r_min = r
+    return (r_min, c_min / freedom)
 
 
 class PHdata(object):
@@ -37,7 +122,7 @@ class PHdata(object):
         """
         a, b, c = p
         y = x / 1000.0
-        return np.sqrt(a*a + b*b / y + c*c / np.power(y, 2)) / 100.0
+        return np.sqrt(a * a + b * b / y + c * c / np.power(y, 2)) / 100.0
 
     @classmethod
     def cal_RF(cls, binedge, p):
@@ -72,7 +157,7 @@ class PHdata(object):
         for i in range(len(Enlist)):
             file_element = os.path.join(
                 cls.dir_RF_elements, "En_%dkeV" % Enlist[i])
-            matrix_RF[:, i] = np.loadtxt(file_element).reshape(-1, 1)
+            matrix_RF[:, i] = np.loadtxt(file_element).reshape(-1, 1)[:, 0]
         return binedge, binmiddle, Enlist, matrix_RF
 
     # shot data analysis ####
@@ -164,7 +249,13 @@ class TOFEDdata(object):
     def set_DGZ_type(self, DGZ_type):
         """ Function doc """
         self.DGZ_type = DGZ_type
-        self.dir_tof = os.path.join(self.dir_shot, self.DGZ_type + "_toflist")
+        self.dir_tof = os.path.join(self.dir_shot, DGZ_cfg[DGZ_type]["name"] + "_toflist")
+
+    def set_up_ring(self, up_list):
+        self.up_list = up_list
+
+    def set_bottom_ring(self, bottom_list):
+        self.bottom_list = bottom_list
 
     def load_divergence(self, filename):
         """ Function doc """
@@ -209,15 +300,21 @@ class TOFEDdata(object):
         if os.path.getsize(filename) == 0:
             return None
         data = np.loadtxt(filename).reshape(-1, 4)
-        offset = self.board_offset[int(ch1/8)] - self.board_offset[int(ch2/8)]
+        offset = self.board_offset[int(ch1 / 8)] - self.board_offset[int(ch2 / 8)]
         if include_divergence:
             offset = offset + self.divergence[(ch1, ch2)]
         data[:, 0] = data[:, 0] + offset
-        return data
+        shape = (data.shape[0], 1)
+        if ch2 in self.up_list:
+            ring_type_list = np.full(shape, RingType.up.value)
+        else:
+            ring_type_list = np.full(shape, RingType.bottom.value)
+        DGZ_type_list = np.full(shape, self.DGZ_type.value)
+        return np.hstack((data[:, 0:3], ring_type_list, DGZ_type_list))
 
     def load_pairs(self, ch1_list, ch2_list, include_divergence=False):
         """ Function doc """
-        data_pairs = np.zeros((1, 4))
+        data_pairs = np.empty((0, 5))
         for ch1 in ch1_list:
             for ch2 in ch2_list:
                 data = self.load_pair(ch1, ch2, include_divergence)
